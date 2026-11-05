@@ -2,6 +2,14 @@
 
 Tutte le modifiche significative a questo progetto saranno documentate in questo file.
 
+## [4.5.3] - 2026-11-05
+
+### Risolto
+
+- **Squilli del campanello mai ricevuti dopo una visione video**: per autenticare l'INVITE la connessione TLS viene chiusa e riaperta, ma senza un nuovo REGISTER. La registrazione è legata alla connessione, quindi il proxy non poteva più consegnare le chiamate in arrivo; inoltre `disconnect()` fermava il loop di ri-registrazione oraria, lasciando HA "sordo" fino al riavvio. Ora dopo la riconnessione si rifà il REGISTER e si attende la conferma prima dell'INVITE.
+
+---
+
 ## [4.5.2] - 2026-11-05
 
 ### Risolto

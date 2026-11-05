@@ -1582,11 +1582,25 @@ class SIPClient:
                         call.state = CallState.DISCONNECTED
                         return None
 
-                    # After reconnect for 407 auth, we're implicitly registered
-                    # because the proxy accepted our previous registration
-                    # Set state to REGISTERED so is_registered returns True
-                    self._registration_state = RegistrationState.REGISTERED
-                    _LOGGER.debug("Set registration state to REGISTERED after 407 reconnect")
+                    # Re-REGISTER on the new connection. The registration is bound
+                    # to the TLS connection: without this the proxy can no longer
+                    # deliver incoming calls (doorbell rings) to us, and disconnect()
+                    # also stopped the hourly re-register loop, so HA stayed "deaf"
+                    # to the doorbell after the first video view until a restart.
+                    self._registration_state = RegistrationState.UNREGISTERED
+                    if await self.register():
+                        for _ in range(80):  # up to 8 s (REGISTER + 401 + REGISTER)
+                            if self._registration_state == RegistrationState.REGISTERED:
+                                break
+                            await asyncio.sleep(0.1)
+                    if self._registration_state != RegistrationState.REGISTERED:
+                        _LOGGER.warning(
+                            "Re-registration after 407 reconnect not confirmed (state=%s); "
+                            "sending the INVITE anyway", self._registration_state
+                        )
+                        self._registration_state = RegistrationState.REGISTERED
+                    else:
+                        _LOGGER.debug("Re-registered after 407 reconnect")
 
                     # Send authenticated INVITE
                     call.state = CallState.CALLING
