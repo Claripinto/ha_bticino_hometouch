@@ -89,6 +89,15 @@ class SIPCall:
     devaddr: str = ""
     station_id: int = 0  # Station number (1-10) for fixed port allocation
     media_mode: MediaMode = MediaMode.VIDEO_ONLY  # Default to video-only for camera viewing
+    # Dialog state (RFC 3261 §12): in-dialog requests (ACK for 2xx, BYE) must be sent
+    # to the remote target (Contact of the 2xx) through the route set (Record-Route,
+    # reversed for the UAC). Without them the BTicino proxy never delivers ACK/BYE to
+    # the gateway, which then tears the call down after 32 s and stays "busy" (486).
+    remote_target: str = ""
+    route_set: list[str] = field(default_factory=list)
+    # Incoming calls: the original INVITE, needed to build 180/487 responses
+    invite_message: str = ""
+    is_outgoing: bool = False
 
 
 # Fixed port ranges for NAT traversal (user needs to forward these ports)
@@ -193,6 +202,104 @@ class SIPClient:
         """Generate a unique Call-ID."""
         self._call_id_counter += 1
         return f"{self._call_id_counter}-{int(time.time())}@{self._config.local_ip}"
+
+    # ------------------------------------------------------------------
+    # Generic SIP header helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _header_values(message: str, name: str) -> list[str]:
+        """Return the values of every header line called `name` (case-insensitive).
+
+        Stops at the end of the header section so SDP lines are never matched.
+        """
+        values: list[str] = []
+        prefix = name.lower() + ":"
+        for line in message.split("\r\n")[1:]:
+            if line == "":
+                break
+            if line.lower().startswith(prefix):
+                values.append(line[len(prefix):].strip())
+        return values
+
+    @classmethod
+    def _header_value(cls, message: str, name: str) -> str:
+        """Return the first value of header `name`, or ''."""
+        values = cls._header_values(message, name)
+        return values[0] if values else ""
+
+    @staticmethod
+    def _split_name_addrs(value: str) -> list[str]:
+        """Split a comma-separated list of name-addr entries ("<a>, <b>")."""
+        return [part.strip() for part in re.findall(r"<[^>]*>[^,]*", value)]
+
+    @staticmethod
+    def _uri_from_name_addr(value: str) -> str:
+        """Extract the URI from a name-addr ("Name" <sip:x@y;p>;tag=z → sip:x@y;p)."""
+        match = re.search(r"<([^>]*)>", value)
+        if match:
+            return match.group(1)
+        return value.split(";")[0].strip()
+
+    def _store_dialog_route(self, call: SIPCall, message: str) -> None:
+        """Store remote target and route set from a dialog-creating response."""
+        contact = self._header_value(message, "contact")
+        if contact:
+            call.remote_target = self._uri_from_name_addr(contact)
+
+        record_routes: list[str] = []
+        for value in self._header_values(message, "record-route"):
+            record_routes.extend(self._split_name_addrs(value))
+        if record_routes:
+            # UAC: route set = Record-Route entries in reverse order
+            call.route_set = list(reversed(record_routes))
+
+        _LOGGER.debug(
+            "Dialog for %s: remote_target=%s, route_set=%s",
+            call.call_id, call.remote_target, call.route_set,
+        )
+
+    def _in_dialog_route_lines(self, call: SIPCall) -> list[str]:
+        """Route header lines for an in-dialog request."""
+        if call.route_set:
+            return [f"Route: {route}" for route in call.route_set]
+        # No Record-Route received: fall back to the outbound proxy
+        return [f"Route: <sip:{self._config.server}:{self._config.port};transport=tls;lr>"]
+
+    def _build_response(
+        self,
+        request: str,
+        status_code: int,
+        reason: str,
+        to_tag: str = "",
+        extra_headers: list[str] | None = None,
+    ) -> str:
+        """Build a correct SIP response to a received request (RFC 3261 §8.2.6).
+
+        Copies every Via (in order), From, To, Call-ID and CSeq from the request;
+        adds a To tag when the request had none and one is given.
+        """
+        lines = [f"SIP/2.0 {status_code} {reason}"]
+        for via in self._header_values(request, "via"):
+            lines.append(f"Via: {via}")
+
+        from_value = self._header_value(request, "from")
+        to_value = self._header_value(request, "to")
+        if to_tag and not re.search(r";\s*tag=[^;\s>]+", to_value):
+            # Drop an empty "tag=" if the sender put one, then add ours
+            to_value = re.sub(r";\s*tag=(?=;|$)", "", to_value)
+            to_value = f"{to_value};tag={to_tag}"
+
+        lines.extend([
+            f"From: {from_value}",
+            f"To: {to_value}",
+            f"Call-ID: {self._header_value(request, 'call-id')}",
+            f"CSeq: {self._header_value(request, 'cseq')}",
+        ])
+        if extra_headers:
+            lines.extend(extra_headers)
+        lines.extend(["Content-Length: 0", "", ""])
+        return "\r\n".join(lines)
 
     async def connect(self) -> bool:
         """Connect to SIP server with TLS."""
@@ -1098,121 +1205,150 @@ class SIPClient:
                 self._on_call_state_changed(call, call.state)
 
     async def _handle_request(self, message: str):
-        """Handle a SIP request."""
-        lines = message.split("\r\n")
-        request_line = lines[0]
-        parts = request_line.split(" ")
-        method = parts[0]
+        """Handle a SIP request received from the server.
 
-        if method == "INVITE":
-            await self._handle_invite(message)
-        elif method == "BYE":
-            await self._handle_bye(message)
-        elif method == "CANCEL":
-            await self._handle_cancel(message)
-        elif method == "OPTIONS":
-            await self._handle_options(message)
+        Every request except ACK gets a well-formed response (Via/From/To/Call-ID/
+        CSeq copied from the request). The original code answered BYE and OPTIONS
+        with a bare "200 OK" without those headers: the proxy could not match it,
+        kept retransmitting the BYE and the gateway stayed busy (486).
+        """
+        request_line = message.split("\r\n", 1)[0]
+        method = request_line.split(" ")[0]
+
+        try:
+            if method == "INVITE":
+                await self._handle_invite(message)
+            elif method == "ACK":
+                pass  # ACK never gets a response
+            elif method == "BYE":
+                await self._handle_bye(message)
+            elif method == "CANCEL":
+                await self._handle_cancel(message)
+            elif method == "OPTIONS":
+                await self._handle_options(message)
+            elif method in ("NOTIFY", "INFO", "MESSAGE", "UPDATE"):
+                await self._send(self._build_response(message, 200, "OK", to_tag=self._generate_tag()))
+            else:
+                await self._send(self._build_response(message, 501, "Not Implemented", to_tag=self._generate_tag()))
+        except ConnectionError as e:
+            _LOGGER.warning("Could not answer %s: %s", method, e)
 
     async def _handle_invite(self, message: str):
-        """Handle incoming INVITE."""
-        # Parse headers
-        call_id = ""
-        from_header = ""
-        to_header = ""
+        """Handle incoming INVITE (someone rang the outdoor station)."""
+        call_id = self._header_value(message, "call-id")
+        from_header = self._header_value(message, "from")
+        to_header = self._header_value(message, "to")
+        cseq_value = self._header_value(message, "cseq")
+        try:
+            cseq = int(cseq_value.split()[0])
+        except (ValueError, IndexError):
+            cseq = 1
+
         via_branch = ""
-        cseq = 0
-        remote_uri = ""
+        vias = self._header_values(message, "via")
+        if vias:
+            via_match = re.search(r"branch=([^;,\s]+)", vias[0])
+            if via_match:
+                via_branch = via_match.group(1)
 
-        lines = message.split("\r\n")
-        request_line = lines[0]
-        parts = request_line.split(" ")
-        if len(parts) >= 2:
-            remote_uri = parts[1]
+        existing = self._calls.get(call_id)
 
-        for line in lines:
-            lower = line.lower()
-            if lower.startswith("call-id:"):
-                call_id = line[8:].strip()
-            elif lower.startswith("from:"):
-                from_header = line[5:].strip()
-            elif lower.startswith("to:"):
-                to_header = line[3:].strip()
-            elif lower.startswith("via:"):
-                via_match = re.search(r'branch=([^;,\s]+)', line)
-                if via_match:
-                    via_branch = via_match.group(1)
-            elif lower.startswith("cseq:"):
-                cseq_parts = line.split()
-                if len(cseq_parts) >= 2:
-                    cseq = int(cseq_parts[1])
+        # Our own outgoing call forked back to us by the proxy (same Call-ID):
+        # never treat it as a doorbell ring.
+        if existing and existing.is_outgoing:
+            _LOGGER.debug("Ignoring INVITE for our own outgoing call %s (loop)", call_id)
+            await self._send(self._build_response(message, 482, "Loop Detected", to_tag=self._generate_tag()))
+            return
 
-        # Create call object
+        # Retransmission of an INVITE we already know: repeat 180, don't ring again
+        if existing and existing.state == CallState.INCOMING:
+            _LOGGER.debug("INVITE retransmission for %s, re-sending 180", call_id)
+            await self._send(self._build_response(message, 180, "Ringing", to_tag=existing.local_tag))
+            return
+
+        # re-INVITE inside an existing dialog: not supported, refuse without ringing
+        if existing and re.search(r";\s*tag=[^;\s>]+", to_header):
+            _LOGGER.debug("Refusing re-INVITE for %s", call_id)
+            await self._send(self._build_response(message, 488, "Not Acceptable Here"))
+            return
+
+        local_tag = self._generate_tag()
+        request_line = message.split("\r\n", 1)[0].split(" ")
         call = SIPCall(
             call_id=call_id,
             state=CallState.INCOMING,
-            remote_uri=remote_uri,
+            remote_uri=self._uri_from_name_addr(from_header) or (request_line[1] if len(request_line) > 1 else ""),
+            local_tag=local_tag,
             from_header=from_header,
             to_header=to_header,
             branch=via_branch,
             cseq=cseq,
+            invite_message=message,
+            is_outgoing=False,
         )
-
         self._calls[call_id] = call
 
-        # Send 180 Ringing
-        ringing = self._build_ringing_response(call)
-        await self._send(ringing)
+        await self._send(self._build_response(message, 180, "Ringing", to_tag=local_tag))
 
-        # Notify callback
+        _LOGGER.info("Incoming INVITE %s from %s", call_id, from_header)
         if self._on_incoming_call:
             self._on_incoming_call(call)
 
-    def _build_ringing_response(self, call: SIPCall) -> str:
-        """Build 180 Ringing response."""
-        lines = [
-            "SIP/2.0 180 Ringing",
-            f"Via: SIP/2.0/TLS {self._config.local_ip}:{self._config.local_port};branch={call.branch}",
-            f"From: {call.from_header}",
-            f"To: {call.to_header};tag={self._generate_tag()}",
-            f"Call-ID: {call.call_id}",
-            f"CSeq: {call.cseq} INVITE",
-            "Content-Length: 0",
-            "",
-            "",
-        ]
-
-        return "\r\n".join(lines)
+    async def reject_incoming_call(self, call_id: str, status_code: int = 487,
+                                   reason: str = "Request Terminated") -> None:
+        """Send a final response to a ringing incoming call and close it locally."""
+        call = self._calls.get(call_id)
+        if not call or call.state != CallState.INCOMING or not call.invite_message:
+            return
+        try:
+            await self._send(self._build_response(
+                call.invite_message, status_code, reason, to_tag=call.local_tag
+            ))
+        except ConnectionError as e:
+            _LOGGER.debug("Could not send %d for %s: %s", status_code, call_id, e)
+        call.state = CallState.DISCONNECTED
+        if self._on_call_state_changed:
+            self._on_call_state_changed(call, call.state)
 
     async def _handle_bye(self, message: str):
-        """Handle BYE request."""
-        # Find Call-ID
-        call_id = ""
-        for line in message.split("\r\n"):
-            if line.lower().startswith("call-id:"):
-                call_id = line[8:].strip()
-                break
-
+        """Handle BYE request (remote side ended the call)."""
+        call_id = self._header_value(message, "call-id")
         call = self._calls.get(call_id)
-        if call:
+
+        # Answer first, with a proper response, so the proxy stops retransmitting
+        await self._send(self._build_response(message, 200, "OK"))
+
+        if call and call.state != CallState.DISCONNECTED:
+            _LOGGER.info("Call %s ended by remote BYE", call_id)
             call.state = CallState.DISCONNECTED
             if self._on_call_state_changed:
                 self._on_call_state_changed(call, call.state)
-
-        # Send 200 OK
-        # Simplified response
-        ok_response = f"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"
-        await self._send(ok_response)
+        elif not call:
+            _LOGGER.debug("BYE for unknown call %s (answered 200 anyway)", call_id)
 
     async def _handle_cancel(self, message: str):
-        """Handle CANCEL request."""
-        # Similar to BYE
-        pass
+        """Handle CANCEL: the ring stopped (answered elsewhere or caller gave up)."""
+        call_id = self._header_value(message, "call-id")
+        call = self._calls.get(call_id)
+
+        # 200 OK for the CANCEL transaction itself
+        await self._send(self._build_response(
+            message, 200, "OK", to_tag=call.local_tag if call else ""
+        ))
+
+        if call and call.state == CallState.INCOMING:
+            _LOGGER.info("Incoming call %s cancelled by remote", call_id)
+            # 487 closes the INVITE transaction
+            await self.reject_incoming_call(call_id, 487, "Request Terminated")
+        else:
+            _LOGGER.debug("CANCEL for unknown/finished call %s", call_id)
 
     async def _handle_options(self, message: str):
-        """Handle OPTIONS request (keepalive)."""
-        # Send 200 OK
-        ok_response = f"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"
-        await self._send(ok_response)
+        """Handle OPTIONS request (keepalive from the server)."""
+        await self._send(self._build_response(
+            message, 200, "OK", to_tag=self._generate_tag(),
+            extra_headers=["Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, NOTIFY"],
+        ))
 
     async def _heartbeat_loop(self):
         """Send periodic OPTIONS to keep connection alive and detect dead connections.
@@ -1410,6 +1546,7 @@ class SIPClient:
             devaddr=devaddr,
             station_id=station_id,  # Store station_id for fixed port allocation
             media_mode=media_mode,
+            is_outgoing=True,
         )
 
         self._calls[call_id] = call
@@ -1654,15 +1791,26 @@ class SIPClient:
             # Ringing / Session Progress
             call.state = CallState.EARLY
             call.remote_tag = to_tag
+            if to_tag:
+                self._store_dialog_route(call, message)
         elif status_code == 200:
+            # 200 OK retransmission (our ACK was lost): just ACK again
+            if call.state == CallState.CONNECTED and call.remote_tag == to_tag:
+                _LOGGER.debug("200 OK retransmission for %s, re-sending ACK", call_id)
+                await self._send(self._build_ack(call))
+                return
+
             # OK - call established
             call.state = CallState.CONNECTED
             call.remote_tag = to_tag
 
+            # Remote target + route set: required to deliver ACK and BYE
+            self._store_dialog_route(call, message)
+
             # Parse SDP from response to get SRTP parameters
             self._parse_sdp_response(call, message)
 
-            # Send ACK
+            # Send ACK (in-dialog, through the route set)
             ack = self._build_ack(call)
             await self._send(ack)
 
@@ -1699,8 +1847,9 @@ class SIPClient:
                     _LOGGER.debug("INVITE auth params: realm=%s, nonce=%s...",
                                   self._proxy_realm, self._proxy_nonce[:16] if self._proxy_nonce else "")
 
-                    # Send ACK to complete the 407 transaction
-                    ack = self._build_ack(call)
+                    # Send ACK to complete the 407 transaction (same branch as the
+                    # INVITE and the To tag of the 407, as RFC 3261 §17.1.1.3 requires)
+                    ack = self._build_ack_non_2xx(call, to_tag)
                     await self._send(ack)
 
                     # Signal that we need to reconnect for authenticated INVITE
@@ -1767,19 +1916,54 @@ class SIPClient:
         return "\r\n".join(lines)
 
     def _build_ack(self, call: SIPCall) -> str:
-        """Build an ACK request."""
+        """Build the ACK for a 2xx: a new in-dialog request (RFC 3261 §13.2.2.4).
+
+        Request-URI is the remote target (Contact of the 200 OK) and the request
+        follows the route set, otherwise the proxy cannot deliver it and the
+        gateway drops the call after 32 s.
+        """
         branch = self._generate_branch()
 
         from_uri = f"sip:{self._config.username}@{self._config.domain}"
         to_uri = call.remote_uri
+        request_uri = call.remote_target or to_uri
 
         to_header = f"<{to_uri}>"
         if call.remote_tag:
             to_header = f"<{to_uri}>;tag={call.remote_tag}"
 
         lines = [
+            f"ACK {request_uri} SIP/2.0",
+            f"Via: SIP/2.0/TLS {self._config.local_ip}:{self._config.local_port};branch={branch}",
+            *self._in_dialog_route_lines(call),
+            f"From: <{from_uri}>;tag={call.local_tag}",
+            f"To: {to_header}",
+            f"Call-ID: {call.call_id}",
+            f"CSeq: {call.cseq} ACK",
+            f"Contact: <sip:{self._config.username}@{self._config.local_ip}:{self._config.local_port};transport=tls>",
+            "Max-Forwards: 70",
+            "Content-Length: 0",
+            "",
+            "",
+        ]
+
+        return "\r\n".join(lines)
+
+    def _build_ack_non_2xx(self, call: SIPCall, to_tag: str) -> str:
+        """Build the ACK for a non-2xx final response (e.g. 407).
+
+        Part of the INVITE transaction: same branch and Request-URI as the INVITE,
+        To tag taken from the response.
+        """
+        from_uri = f"sip:{self._config.username}@{self._config.domain}"
+        to_uri = call.remote_uri
+        to_header = f"<{to_uri}>;tag={to_tag}" if to_tag else f"<{to_uri}>"
+        branch = call.branch or self._generate_branch()
+
+        lines = [
             f"ACK {to_uri} SIP/2.0",
             f"Via: SIP/2.0/TLS {self._config.local_ip}:{self._config.local_port};branch={branch}",
+            f"Route: <sip:{self._config.server}:{self._config.port};transport=tls;lr>",
             f"From: <{from_uri}>;tag={call.local_tag}",
             f"To: {to_header}",
             f"Call-ID: {call.call_id}",
@@ -1789,7 +1973,6 @@ class SIPClient:
             "",
             "",
         ]
-
         return "\r\n".join(lines)
 
     def _parse_sdp_response(self, call: SIPCall, message: str):
@@ -1888,39 +2071,55 @@ class SIPClient:
                     remote_audio_port, audio_key_b64)
 
     async def hangup_call(self, call_id: str) -> bool:
-        """Hangup a call by sending BYE."""
+        """Hang up a call.
+
+        Outgoing/established call: BYE through the dialog route.
+        Ringing incoming call: 486 Busy Here (we decline it, the HOMETOUCH and the
+        app keep ringing).
+        """
         call = self._calls.get(call_id)
         if not call:
             return False
 
+        if call.state == CallState.DISCONNECTED:
+            return True
+
+        if call.state == CallState.INCOMING:
+            await self.reject_incoming_call(call_id, 486, "Busy Here")
+            return True
+
         try:
             bye = self._build_bye(call)
             await self._send(bye)
-            call.state = CallState.DISCONNECTED
-
-            if self._on_call_state_changed:
-                self._on_call_state_changed(call, call.state)
-
-            return True
+            _LOGGER.info("Sent BYE for call %s to %s", call_id, call.remote_target or call.remote_uri)
         except Exception as e:
             _LOGGER.error("Failed to hangup call: %s", e)
-            return False
+            # Even if the BYE could not be sent, release the call locally
+        finally:
+            if call.state != CallState.DISCONNECTED:
+                call.state = CallState.DISCONNECTED
+                if self._on_call_state_changed:
+                    self._on_call_state_changed(call, call.state)
+
+        return True
 
     def _build_bye(self, call: SIPCall) -> str:
-        """Build a BYE request."""
+        """Build a BYE request (in-dialog: remote target + route set)."""
         branch = self._generate_branch()
         call.cseq += 1
 
         from_uri = f"sip:{self._config.username}@{self._config.domain}"
         to_uri = call.remote_uri
+        request_uri = call.remote_target or to_uri
 
         to_header = f"<{to_uri}>"
         if call.remote_tag:
             to_header = f"<{to_uri}>;tag={call.remote_tag}"
 
         lines = [
-            f"BYE {to_uri} SIP/2.0",
+            f"BYE {request_uri} SIP/2.0",
             f"Via: SIP/2.0/TLS {self._config.local_ip}:{self._config.local_port};branch={branch}",
+            *self._in_dialog_route_lines(call),
             f"From: <{from_uri}>;tag={call.local_tag}",
             f"To: {to_header}",
             f"Call-ID: {call.call_id}",

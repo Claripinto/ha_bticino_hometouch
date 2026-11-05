@@ -66,8 +66,11 @@ class BticinoDoorbellSensor(CoordinatorEntity, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return True if someone is at the door (incoming call)."""
-        return self.coordinator.has_active_call
+        """Return True only while someone is ringing (incoming call).
+
+        Our own video calls are outgoing and must not turn the doorbell on.
+        """
+        return self.coordinator.is_ringing
 
 
 class BticinoConnectionSensor(CoordinatorEntity, BinarySensorEntity):

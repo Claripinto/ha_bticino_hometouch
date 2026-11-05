@@ -2,6 +2,21 @@
 
 Tutte le modifiche significative a questo progetto saranno documentate in questo file.
 
+## [4.5.2] - 2026-11-05
+
+### Risolto
+
+- **"Citofono occupato" (486) dopo la prima chiamata video**: ACK e BYE venivano inviati a `sip:MHT@<dominio>` senza seguire il dialogo. Il proxy non li consegnava al gateway, che chiudeva la chiamata dopo 32 s (ACK mai ricevuto) e restava occupato. Ora ACK e BYE usano il remote target (Contact del 200 OK) e il route set (Record-Route invertiti), come da RFC 3261 §12/§13.
+- **Risposte SIP malformate**: BYE e OPTIONS in arrivo ricevevano un `200 OK` senza Via/From/To/Call-ID/CSeq; il proxy non lo associava alla transazione e ritrasmetteva il BYE. Ora tutte le risposte copiano gli header obbligatori (RFC 3261 §8.2.6), anche il `180 Ringing`.
+- **Falsi squilli del campanello**: `binary_sensor.bticino_hometouch_doorbell` era acceso con qualsiasi chiamata attiva, comprese le nostre chiamate video in uscita. Ora è acceso solo mentre squilla una chiamata **in arrivo**.
+- **CANCEL non gestito**: quando la chiamata viene risposta altrove o il visitatore se ne va, ora si risponde `200 OK` al CANCEL e `487` all'INVITE, e il campanello si spegne. In più un timeout di sicurezza chiude uno squillo rimasto aperto oltre 60 s.
+- **ACK del 407**: ora usa lo stesso branch dell'INVITE e il To tag della risposta (RFC 3261 §17.1.1.3).
+- **INVITE ripetuti / di ritorno**: le ritrasmissioni non fanno più squillare due volte; una nostra chiamata rimandata indietro dal proxy riceve `482 Loop Detected` invece di sembrare uno squillo.
+- **Riaggancio**: `hangup_call` rilascia sempre la chiamata in locale; su uno squillo in arrivo risponde `486` (rifiuta solo su HA, l'HOMETOUCH continua a squillare).
+- Notifica integrata: se `notify.mobile_app` non esiste non genera più errori.
+
+---
+
 ## [4.5.1] - 2026-10-14
 
 ### Risolto

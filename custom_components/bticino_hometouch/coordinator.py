@@ -233,9 +233,18 @@ class BticinoCoordinator(DataUpdateCoordinator):
 
     @callback
     def _on_incoming_call(self, call: SIPCall):
-        """Handle incoming call."""
+        """Handle incoming call (someone rang the outdoor station)."""
+        if self._current_call and self._current_call.call_id != call.call_id \
+                and self._current_call.state != CallState.DISCONNECTED:
+            # We are already watching video: the new ring still has to be
+            # reported, it simply replaces the tracked call afterwards.
+            _LOGGER.info("Incoming call while another call is active")
         self._current_call = call
         self._incoming_call_event.set()
+
+        # Safety net: if the gateway never sends CANCEL/BYE, stop "ringing"
+        # after RINGING_TIMEOUT so the doorbell sensor cannot stay on forever.
+        self.hass.async_create_task(self._expire_ringing(call.call_id))
 
         # Determine which station is calling (from caller URI or DEVADDR)
         # Default to station 1 if we can't determine
@@ -267,6 +276,18 @@ class BticinoCoordinator(DataUpdateCoordinator):
 
         _LOGGER.info("Incoming call from station %d (%s)", station_id, call.remote_uri)
 
+    RINGING_TIMEOUT = 60  # seconds
+
+    async def _expire_ringing(self, call_id: str) -> None:
+        """Close an incoming call that is still ringing after RINGING_TIMEOUT."""
+        await asyncio.sleep(self.RINGING_TIMEOUT)
+        call = self._current_call
+        if call and call.call_id == call_id and call.state == CallState.INCOMING:
+            _LOGGER.info("Incoming call %s still ringing after %ds, closing it",
+                         call_id, self.RINGING_TIMEOUT)
+            if self._sip_client:
+                await self._sip_client.reject_incoming_call(call_id, 480, "Temporarily Unavailable")
+
     def _parse_station_id(self, remote_uri: str) -> int | None:
         """Parse station ID from caller URI."""
         # The URI might contain station info like "sip:station1@gateway"
@@ -284,7 +305,13 @@ class BticinoCoordinator(DataUpdateCoordinator):
     @callback
     def _on_call_state_changed(self, call: SIPCall, state: CallState):
         """Handle call state change."""
-        _LOGGER.info("Call state changed to %s", state)
+        _LOGGER.info("Call %s state changed to %s", call.call_id, state)
+
+        # A late BYE/487 for an older call must not tear down the current one
+        if self._current_call and call.call_id != self._current_call.call_id:
+            _LOGGER.debug("State change for non-current call %s ignored", call.call_id)
+            self.async_set_updated_data(self.data)
+            return
 
         if state == CallState.CONNECTED:
             # Update station state to connected
@@ -460,6 +487,11 @@ class BticinoCoordinator(DataUpdateCoordinator):
         """Send push notification via Home Assistant companion app."""
         # Get camera image URL
         camera_entity = f"camera.bticino_hometouch_outdoor_station_{station_id}"
+
+        if not self.hass.services.has_service("notify", "mobile_app"):
+            _LOGGER.debug("notify.mobile_app not available, skipping built-in notification "
+                          "(use the bticino_hometouch_incoming_call event in an automation)")
+            return
 
         await self.hass.services.async_call(
             "notify",
@@ -845,6 +877,16 @@ class BticinoCoordinator(DataUpdateCoordinator):
     def has_active_call(self) -> bool:
         """Return True if there's an active call."""
         return self._current_call is not None
+
+    @property
+    def is_ringing(self) -> bool:
+        """Return True only while an INCOMING call is ringing.
+
+        The doorbell sensor used has_active_call, which is also true while we
+        watch video (our own outgoing call): every video view looked like a ring.
+        """
+        call = self._current_call
+        return call is not None and not call.is_outgoing and call.state == CallState.INCOMING
 
     @property
     def call_state(self) -> CallState | None:
